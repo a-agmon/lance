@@ -7685,6 +7685,79 @@ mod tests {
         );
     }
 
+    // Regression test for the FTS posting-list writer deadlock. A partition whose
+    // posting lists span many output batches forces the writer's producer to fill
+    // the bounded channel and wait for the consumer to drain it. The producer now
+    // dispatches batches with an async `send().await`, so a full channel yields the
+    // task instead of parking the CPU-pool thread the consumer's column encoder
+    // also needs. Before the fix this deadlocked at 0% CPU whenever the CPU pool
+    // had a single thread (hosts with <= 3 visible CPUs). The timeout guards
+    // against a regression, and the searches confirm every batch was written.
+    #[tokio::test]
+    async fn test_write_many_posting_list_batches_does_not_deadlock() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // The default posting-list batch size is 256 rows, so 1000 distinct tokens
+        // make `write_posting_lists` emit several batches and exercise channel
+        // back-pressure (the deadlock required reaching a second, blocking send).
+        let num_tokens = 1000u64;
+        let row_id_base = 1_000u64;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for i in 0..num_tokens {
+            // Zero-padded so tokens are inserted in sorted order, as the set expects.
+            builder.tokens.add(format!("tok{i:05}"));
+            let doc_id = builder.docs.append(row_id_base + i, 1);
+            let mut posting_list = PostingListBuilder::new(false);
+            posting_list.add(doc_id, PositionRecorder::Count(1));
+            builder.posting_lists.push(posting_list);
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            builder.write(store.as_ref()),
+        )
+        .await
+        .expect("writing posting lists should not hang")
+        .expect("writing posting lists should succeed");
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Probe a token from the first, a middle, and the last batch to confirm
+        // that no batch was dropped or reordered while crossing the channel.
+        for token_idx in [0u64, num_tokens / 2, num_tokens - 1] {
+            let tokens = Arc::new(Tokens::new(
+                vec![format!("tok{token_idx:05}")],
+                DocType::Text,
+            ));
+            let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+            let (row_ids, _) = index
+                .bm25_search(
+                    tokens,
+                    params,
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                row_ids,
+                vec![row_id_base + token_idx],
+                "token tok{token_idx:05} should map to its single document"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_and_query_skips_partition_missing_required_term() {
         let tmpdir = TempObjDir::default();
