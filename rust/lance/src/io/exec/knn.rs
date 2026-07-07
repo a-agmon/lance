@@ -2646,7 +2646,7 @@ mod tests {
             // in batches of STREAMING_SEARCH_BATCH_SIZE, one `spawn_cpu` per batch, with
             // the channel send in async code so no CPU-pool thread parks (#7642).
             tokio::spawn(async move {
-                for chunk in prepared_partition_ids.chunks(STREAMING_SEARCH_BATCH_SIZE) {
+                for chunk in prepared_partition_ids.chunks(*STREAMING_SEARCH_BATCH_SIZE) {
                     if control
                         .as_ref()
                         .is_some_and(|control| control.should_stop())
@@ -2904,12 +2904,10 @@ mod tests {
     // so they are searched in one `spawn_cpu` dispatch and therefore share one cpu thread.
     #[tokio::test]
     async fn test_sequential_initial_search_prepares_all_then_searches_on_one_cpu_thread() {
-        const {
-            assert!(
-                3 <= STREAMING_SEARCH_BATCH_SIZE,
-                "test assumes all partitions fit in one search batch",
-            )
-        };
+        assert!(
+            3 <= *STREAMING_SEARCH_BATCH_SIZE,
+            "test assumes all partitions fit in one search batch",
+        );
         let (index, prepared_partitions, searched_partitions, search_threads) =
             prepared_index(vec![10, 11, 12]);
         let mut query = base_query();
@@ -2955,7 +2953,7 @@ mod tests {
     // impractical to force in a unit test (same limitation noted for the #7423 fix).
     #[tokio::test]
     async fn test_sequential_search_spans_multiple_cpu_batches() {
-        let num_partitions = STREAMING_SEARCH_BATCH_SIZE + 3;
+        let num_partitions = *STREAMING_SEARCH_BATCH_SIZE + 3;
         let row_ids = (0..num_partitions).map(|i| i as u64 * 10).collect();
         let (index, prepared_partitions, searched_partitions, search_threads) =
             prepared_index(row_ids);
