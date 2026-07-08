@@ -1760,17 +1760,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let scratch_pool = scratch_pool.clone();
                     let search_metrics = search_metrics.clone();
                     let search_control = search_control.clone();
+                    // `is_closed` is synchronously callable, so a sender clone lets the
+                    // CPU loop notice a dropped receiver between partitions instead of
+                    // searching out the whole batch for a cancelled query. (A `select!`
+                    // on `closed()` would not help here: `spawn_cpu` closures are not
+                    // cancellable, so abandoning the await leaves the work running.)
+                    let cancel_probe = batch_tx.clone();
                     let search_output = spawn_cpu(move || {
                         let mut outputs: Vec<DataFusionResult<RecordBatch>> =
                             Vec::with_capacity(prepared_batch.len());
-                        // `stopped` means the whole search should end (an error, or an
-                        // early-stop signal), not just this batch.
+                        // `stopped` means the whole search should end (an error, an
+                        // early-stop signal, or cancellation), not just this batch.
                         let mut stopped = false;
                         scratch_pool.with_scratch(|scratch| {
                             for prepared in prepared_batch {
                                 if search_control
                                     .as_ref()
                                     .is_some_and(|control| control.should_stop())
+                                    || cancel_probe.is_closed()
                                 {
                                     stopped = true;
                                     break;

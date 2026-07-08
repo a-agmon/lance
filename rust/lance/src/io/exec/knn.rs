@@ -2650,12 +2650,14 @@ mod tests {
                     if control
                         .as_ref()
                         .is_some_and(|control| control.should_stop())
+                        || batch_tx.is_closed()
                     {
                         return;
                     }
                     let chunk = chunk.to_vec();
                     let index = self.clone();
                     let control_for_search = control.clone();
+                    let cancel_probe = batch_tx.clone();
                     let search_output = spawn_cpu(move || {
                         let mut outputs: Vec<DataFusionResult<RecordBatch>> =
                             Vec::with_capacity(chunk.len());
@@ -2664,6 +2666,7 @@ mod tests {
                             if control_for_search
                                 .as_ref()
                                 .is_some_and(|control| control.should_stop())
+                                || cancel_probe.is_closed()
                             {
                                 stopped = true;
                                 break;
@@ -2900,25 +2903,29 @@ mod tests {
         );
     }
 
-    // The three partitions fit in a single search batch (3 <= STREAMING_SEARCH_BATCH_SIZE),
-    // so they are searched in one `spawn_cpu` dispatch and therefore share one cpu thread.
+    // All partitions fit in a single search batch, so they are searched in one
+    // `spawn_cpu` dispatch and therefore share one cpu thread. The partition count
+    // adapts to the configured batch size so the single-batch property holds under
+    // any valid `LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE`, including 1.
     #[tokio::test]
     async fn test_sequential_initial_search_prepares_all_then_searches_on_one_cpu_thread() {
-        assert!(
-            3 <= *STREAMING_SEARCH_BATCH_SIZE,
-            "test assumes all partitions fit in one search batch",
-        );
+        let num_partitions = 3.min(*STREAMING_SEARCH_BATCH_SIZE);
+        let row_ids = (0..num_partitions).map(|i| 10 + i as u64).collect();
         let (index, prepared_partitions, searched_partitions, search_threads) =
-            prepared_index(vec![10, 11, 12]);
+            prepared_index(row_ids);
         let mut query = base_query();
-        query.minimum_nprobes = 3;
+        query.minimum_nprobes = num_partitions;
         let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
 
+        let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
+        let q_c_dists = (0..num_partitions)
+            .map(|i| i as f32 * 0.1)
+            .collect::<Vec<_>>();
         let batches = ANNIvfSubIndexExec::initial_search(
             index,
             query,
-            Arc::new(UInt32Array::from(vec![0, 1, 2])),
-            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+            Arc::new(UInt32Array::from(partition_idx)),
+            Arc::new(Float32Array::from(q_c_dists)),
             empty_prefilter().await,
             prepared_metrics(),
             state,
@@ -2928,11 +2935,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(batches.len(), 3);
-        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*searched_partitions.lock().unwrap(), vec![0, 1, 2]);
+        let expected: Vec<usize> = (0..num_partitions).collect();
+        assert_eq!(batches.len(), num_partitions);
+        assert_eq!(*prepared_partitions.lock().unwrap(), expected);
+        assert_eq!(*searched_partitions.lock().unwrap(), expected);
         let search_threads = search_threads.lock().unwrap().clone();
-        assert_eq!(search_threads.len(), 3);
+        assert_eq!(search_threads.len(), num_partitions);
         assert!(
             search_threads.iter().all(|name| name.contains("lance-cpu")),
             "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
